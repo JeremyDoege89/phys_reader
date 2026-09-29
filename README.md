@@ -18,12 +18,45 @@ A C compiler + kbuild can't produce a module that satisfies all three without th
 
 Maps a physical memory region with `memremap()` and exposes it as `/proc/phys_reader` (read-only, mode 0444). Designed for reading AP↔Modem shared memory on MediaTek CCCI devices.
 
-Two pre-built variants:
+Three pre-built variants:
 
-| Module | Region | Address | Size |
-|--------|--------|---------|------|
-| `phys_reader_v3.ko` | ap_md_c_smem (cacheable) | `0x8A000000` | 26.4 MB |
-| `phys_reader_nc.ko` | ap_md_nc_smem (non-cacheable) | `0x8C000000` | 1.2 MB |
+| Module | Region | Address | Size | Writable |
+|--------|--------|---------|------|----------|
+| `phys_reader_v3.ko` | ap_md_c_smem (cacheable) | `0x8A000000` | 26.4 MB | No |
+| `phys_reader_nc.ko` | ap_md_nc_smem (non-cacheable) | `0x8C000000` | 1.2 MB | No |
+| `phys_reader_param.ko` | Configurable (default DRAM base) | `0x40000000` | 256 MB | Yes |
+
+### phys_reader_param
+
+The parameterized variant adds a **write handler** — you can remap the window at runtime without reloading:
+
+```bash
+insmod phys_reader_param.ko
+# default: 0x40000000 + 256MB
+
+# remap to a different region
+echo "0x8A000000 0x1A60000" > /proc/phys_reader_param
+
+# dump
+dd if=/proc/phys_reader_param of=/sdcard/ram.bin bs=1M
+
+rmmod phys_reader_param
+```
+
+Read chunk size is 1MB (vs 4K in the fixed variants), so `dd bs=1M` works. Size is capped at 1GB per window. The write handler parses hex with LDTR (unprivileged loads), so no additional kernel imports are needed.
+
+**Sweeping all of DRAM:**
+
+```bash
+# get the real ranges first
+cat /proc/iomem | grep 'System RAM'
+
+# then loop in 256MB windows
+for off in $(seq 0x40000000 0x10000000 0x23FFFFFFF); do
+  printf "0x%x 0x10000000" $off > /proc/phys_reader_param
+  dd if=/proc/phys_reader_param of=/sdcard/ram_$(printf %x $off).bin bs=1M
+done
+```
 
 ## Build
 
