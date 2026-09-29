@@ -1,175 +1,116 @@
-phys_reader — Physical Memory Reader Kernel Module for MT6878 (Moto Edge 2025)
-================================================================================
+# phys_reader
 
-Kernel: 6.1.141-android14-11-gb4b551f657d1 (GKI)
-SoC:    MediaTek Dimensity 7300 (MT6878)
-Root:   KernelSU Next 3.3.0
+Loadable kernel module for reading physical memory regions on MediaTek GKI kernels. Written entirely in AArch64 assembly to satisfy CFI (Control Flow Integrity), PAC (Pointer Authentication), and section layout requirements that prevent normal C-compiled modules from loading.
 
-WHAT IT DOES
-------------
-Loads a kernel module that maps a physical memory region via memremap()
-and exposes it as /proc/phys_reader for userspace reads. Designed to
-read AP-MD (Application Processor ↔ Modem) shared memory regions.
+Built for the **MT6878 (Dimensity 7300)** running **GKI kernel 6.1.141**, but the approach generalizes to any arm64 GKI kernel with `CONFIG_CFI_CLANG` enabled.
 
-Two variants included:
+## Why Assembly?
 
-  phys_reader_v3.ko  — Maps ap_md_c_smem  (0x8A000000, 26.4MB cacheable shared mem)
-  phys_reader_nc.ko  — Maps ap_md_nc_smem (0x8C000000, 1.2MB non-cacheable shared mem)
+GKI kernels on MediaTek devices enforce three things that break conventionally compiled `.ko` files:
 
+1. **CONFIG_CFI_CLANG** — Every function called through a pointer must have a 4-byte KCFI type hash at `[function_address - 4]`. Wrong tag = kernel panic.
+2. **PAC (Pointer Authentication)** — All kernel functions use `paciasp`/`autiasp` for return address signing.
+3. **Strict section placement** — `init_module` must live in `.init.text`, `cleanup_module` in `.exit.text`, and the module needs `.plt`/`.init.plt` stubs.
 
-FILES
------
-  phys_reader_v3.S   — Full assembly source for the cacheable variant
-  phys_reader_v3.ko  — Pre-built module (5912 bytes)
-  phys_reader_nc.S   — Full assembly source for the non-cacheable variant
-  phys_reader_nc.ko  — Pre-built module (5928 bytes)
+A C compiler + kbuild can't produce a module that satisfies all three without the full kernel source tree. A single `.S` file can.
 
+## What It Does
 
-WHY ASSEMBLY?
--------------
-This kernel (GKI 6.1 on MT6878) has three features that prevent normal
-C-compiled modules from loading:
+Maps a physical memory region with `memremap()` and exposes it as `/proc/phys_reader` (read-only, mode 0444). Designed for reading AP↔Modem shared memory on MediaTek CCCI devices.
 
-1. CONFIG_CFI_CLANG — Control Flow Integrity. Every function called via
-   indirect call (function pointer) needs a 4-byte CFI type hash at
-   [function_address - 4]. The kernel checks this tag before every
-   indirect call and panics if it's wrong.
+Two pre-built variants:
 
-2. PAC (Pointer Authentication) — All kernel functions use paciasp/autiasp
-   instructions for return address signing.
+| Module | Region | Address | Size |
+|--------|--------|---------|------|
+| `phys_reader_v3.ko` | ap_md_c_smem (cacheable) | `0x8A000000` | 26.4 MB |
+| `phys_reader_nc.ko` | ap_md_nc_smem (non-cacheable) | `0x8C000000` | 1.2 MB |
 
-3. Section requirements — init_module MUST be in .init.text, cleanup_module
-   MUST be in .exit.text, and the module needs .plt / .init.plt sections.
+## Build
 
-Writing in assembly lets us place CFI tags, PAC instructions, and sections
-exactly where the kernel expects them.
+Requires only `aarch64-linux-gnu-as` and `aarch64-linux-gnu-ld` (from `gcc-aarch64-linux-gnu` or `binutils-aarch64-linux-gnu`). No kernel headers, no Makefile, no kbuild.
 
+```bash
+aarch64-linux-gnu-as -o phys_reader_v3.o phys_reader_v3.S
+aarch64-linux-gnu-ld -r -o phys_reader_v3.ko phys_reader_v3.o
+```
 
-CFI TAGS (verified from 4 device modules)
-------------------------------------------
-  0x36b1c5a6  int (*)(void)                    — init_module, cleanup helpers
-  0xa540670c  void (*)(void)                   — cleanup_module
-  0xe866e2f4  ssize_t (*)(file*, char __user*, size_t, loff_t*)  — read handler
-  0x8f07ca55  int (*)(struct inode*, struct file*)               — open/release
-  0x9a660ea0  ssize_t (*)(file*, const char __user*, size_t, loff_t*)  — write
-  0x63df1691  int (*)(struct platform_device*) — platform probe/remove
-  0x3f45655f  int (*)(struct device*)          — PM suspend/resume
+## Usage
 
+Requires root (KernelSU, Magisk, etc).
 
-CRC VERSIONS (from device modules — must match running kernel)
---------------------------------------------------------------
-  _printk              0x92997ed8
-  memremap             0x4d924f20
-  memunmap             0x9e9fdd9d
-  __arch_copy_to_user  0x9a85eebb
-  proc_create          0x0524767b
-  remove_proc_entry    0xef8b7667
-  module_layout        0xea759d7f
+```bash
+# Load
+insmod /path/to/phys_reader_v3.ko
 
+# Verify
+dmesg | grep phys_reader
+# → phys_reader: mapped 8a000000+1a60000 -> /proc/phys_reader
 
-STRUCT LAYOUT
--------------
-  struct module:  0x440 bytes total
-    offset 0x170: init function pointer
-    offset 0x3d8: exit function pointer
+# Read
+dd if=/proc/phys_reader of=/sdcard/smem_dump.bin bs=4096
 
-  proc_ops:
-    offset 0x00:  proc_flags (u32, padded to 8)
-    offset 0x08:  proc_open
-    offset 0x10:  proc_read    <-- we set this
-    offset 0x18:  proc_read_iter
-    ...total 0x60 bytes
+# Unload
+rmmod phys_reader
+```
 
+## Targeting a Different Address
 
-HOW TO BUILD (cross-compile from Linux x86_64)
------------------------------------------------
-Requires: aarch64-linux-gnu-as, aarch64-linux-gnu-ld (from gcc-aarch64-linux-gnu)
+Edit the `.S` file and change the physical address and size in `init_module`. The address/size must be valid ARM64 MOV immediates (16-bit value shifted by 0, 16, 32, or 48 bits). If the value doesn't fit a single instruction, use a `movz`/`movk` pair — see `phys_reader_nc.S` for an example.
 
-  # Assemble
-  aarch64-linux-gnu-as -o phys_reader_v3.o phys_reader_v3.S
+## CFI Type Tags
 
-  # Link as relocatable object (.ko)
-  aarch64-linux-gnu-ld -r -o phys_reader_v3.ko phys_reader_v3.o
+Extracted and verified across multiple device modules from the same kernel:
 
-That's it. No kernel headers, no Makefile, no kbuild. The .S file contains
-everything: code, metadata, version CRCs, modinfo, and the module struct.
+| Tag | Function Signature |
+|-----|-------------------|
+| `0x36b1c5a6` | `int (*)(void)` — module init |
+| `0xa540670c` | `void (*)(void)` — module cleanup |
+| `0xe866e2f4` | `ssize_t (*)(struct file *, char __user *, size_t, loff_t *)` — read |
+| `0x9a660ea0` | `ssize_t (*)(struct file *, const char __user *, size_t, loff_t *)` — write |
+| `0x8f07ca55` | `int (*)(struct inode *, struct file *)` — open/release |
+| `0x85e5a61e` | `__poll_t (*)(struct file *, struct poll_table_struct *)` — poll |
+| `0xe01408cd` | `long (*)(struct file *, unsigned int, unsigned long)` — ioctl |
+| `0x63df1691` | `int (*)(struct platform_device *)` — platform probe/remove |
+| `0x3f45655f` | `int (*)(struct device *)` — PM suspend/resume |
 
+These tags are kernel-build-specific. If porting to a different kernel build, extract them from an existing `.ko` on the device — look for the 4-byte `.word` immediately before each function entry in the `.text` disassembly.
 
-HOW TO BUILD FOR A DIFFERENT MEMORY REGION
-------------------------------------------
-Edit the .S file and change:
+## Symbol CRCs
 
-  1. The physical address in init_module (mov x0, #0x8NNNNNNN)
-  2. The region size in init_module (mov x1, #0xNNNNNNN) and in
-     phys_read (mov x19, #...) and in the printk format args
-  3. If the size isn't a valid single MOV immediate (must be a 16-bit
-     value shifted by 0/16/32/48), use movz + movk pair instead.
+Must match the running kernel's exported symbols. These are for `6.1.141-android14-11-gb4b551f657d1`:
 
-Valid single-instruction examples:
-  0x1A60000  = 0x1A6 << 16  ✓
-  0x100000   = 0x10  << 16  ✓
-  0x8A000000 = 0x8A00 << 16 ✓
+| Symbol | CRC |
+|--------|-----|
+| `_printk` | `0x92997ed8` |
+| `memremap` | `0x4d924f20` |
+| `memunmap` | `0x9e9fdd9d` |
+| `__arch_copy_to_user` | `0x9a85eebb` |
+| `proc_create` | `0x0524767b` |
+| `remove_proc_entry` | `0xef8b7667` |
+| `module_layout` | `0xea759d7f` |
 
-Needs two instructions:
-  0x12C000 → movz xN, #0xC000 / movk xN, #0x12, lsl #16
+For a different kernel, pull a stock `.ko` from the device and read its `__versions` section with `objdump -s -j __versions module.ko`.
 
+## Module Struct Layout
 
-HOW TO USE
-----------
-All commands require root (su or KernelSU shell).
+For this kernel, `struct module` is 0x440 bytes:
+- Offset `0x170`: `init` function pointer
+- Offset `0x3d8`: `exit` function pointer
 
-  # Load the module
-  insmod /sdcard/phys_reader/phys_reader_v3.ko
+Verify on your device by checking any stock `.ko`:
+```bash
+aarch64-linux-gnu-objdump -s -j '.gnu.linkonce.this_module' /path/to/any.ko
+```
+Look for the two non-zero quads (the init/exit relocations).
 
-  # Verify it loaded
-  dmesg | grep phys_reader
-  # Should show: "phys_reader: mapped 8a000000+1a60000 -> /proc/phys_reader"
+## Target Device
 
-  # Test with a small read
-  head -c 16 /proc/phys_reader | xxd
+- **Phone**: Moto Edge 2025 (codename oulu, XT2205)
+- **SoC**: MediaTek Dimensity 7300 (MT6878)
+- **Kernel**: `6.1.141-android14-11-gb4b551f657d1`
+- **Root**: KernelSU Next 3.3.0
+- **Module signing**: `CONFIG_MODULE_SIG_FORCE=off`, `modules_disabled=0`
 
-  # Full dump to file
-  dd if=/proc/phys_reader of=/sdcard/smem_dump.bin bs=4096
+## License
 
-  # Unload when done
-  rmmod phys_reader
-
-  # For the nc_smem variant:
-  insmod /sdcard/phys_reader/phys_reader_nc.ko
-  dd if=/proc/phys_reader of=/sdcard/nc_smem_dump.bin bs=4096
-  rmmod phys_reader
-
-
-WHAT'S IN THE SHARED MEMORY
-----------------------------
-ap_md_c_smem (0x8A000000, 26.4MB):
-  - CCCI (Cross Core Communication Interface) headers (magic: FICMFICM)
-  - Modem firmware debug log buffer (~20MB of text log messages)
-  - NVRAM filesystem metadata (LDT file table entries)
-  - SML (SIM Lock) verification trace logs
-  - Carrier configuration data (T-Mobile/MetroPCS APNs, SIP addresses)
-  - SEJ AES encryption operation logs
-
-ap_md_nc_smem (0x8C000000, 1.2MB):
-  - CCCI debug structures (magic: iFiW)
-  - GPS/GNSS calibration data ($PMTK sentences)
-
-
-SAFETY NOTES
--------------
-- This module only READS memory. It does not write to any physical address.
-- memremap creates a virtual mapping; it does not modify the physical memory.
-- The module creates /proc/phys_reader with mode 0444 (read-only).
-- Always rmmod after use to clean up the mapping.
-- Do NOT attempt to map modem-private DRAM (0xD0000000+) — it is protected
-  by the EMI MPU and will cause undefined behavior.
-- Do NOT insmod while another phys_reader is already loaded — rmmod first.
-
-
-KNOWN ISSUES
-------------
-- If you use the wrong CFI tag, insmod succeeds but reading /proc/phys_reader
-  causes a kernel panic. The tags in these modules are verified correct.
-- On reboot, the module is automatically unloaded (not persistent).
-- The module name in lsmod is "phys_reader" for both variants. Only load one
-  at a time.
+GPL (required by kernel module loading).
