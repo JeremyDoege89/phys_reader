@@ -64,7 +64,7 @@ map_ptr:
 
 /* ====================== Data (.data) ====================== */
 /*
- * proc_ops struct (0x60 bytes): proc_read at +0x10, proc_write at +0x18.
+ * proc_ops struct (0x60 bytes): proc_read at +0x10, proc_write at +0x20.
  * Both are set by init_module at runtime.
  */
 .section .data,"aw"
@@ -316,32 +316,11 @@ phys_write:
 .type init_module, %function
 init_module:
 	paciasp
-	stp	x29, x30, [sp, #-32]!
+	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
-	str	x19, [sp, #16]
 
-	/* default window: 0x40000000 + 0x10000000 (verify vs /proc/iomem) */
-	movz	x0, #0x4000, lsl #16
-	movz	x1, #0x1000, lsl #16
-	mov	x2, #1			/* MEMREMAP_WB */
-	bl	memremap
-
-	/* Store map pointer */
-	adrp	x1, map_ptr
-	str	x0, [x1, :lo12:map_ptr]
-
-	/* if (!map) goto fail */
-	cbz	x0, .Linit_fail
-
-	/* Store phys_addr / phys_size / total_size */
-	movz	x19, #0x4000, lsl #16
-	adrp	x1, phys_addr
-	str	x19, [x1, :lo12:phys_addr]
-	movz	x19, #0x1000, lsl #16
-	adrp	x1, phys_size
-	str	x19, [x1, :lo12:phys_size]
-	adrp	x1, total_size
-	str	x19, [x1, :lo12:total_size]
+	/* No default mapping — user writes the desired range via proc.
+	 * total_size/map_ptr stay 0 (BSS), so reads return EOF until set. */
 
 	/* phys_pops.proc_read = phys_read; proc_write = phys_write */
 	adrp	x1, phys_pops
@@ -351,7 +330,7 @@ init_module:
 	str	x2, [x1, #16]
 	adrp	x2, phys_write
 	add	x2, x2, :lo12:phys_write
-	str	x2, [x1, #24]
+	str	x2, [x1, #32]		/* proc_write at offset 0x20 */
 
 	/* proc_create("phys_reader_param", 0644, NULL, &phys_pops) */
 	adrp	x3, phys_pops
@@ -362,29 +341,16 @@ init_module:
 	mov	x2, #0			/* parent = NULL */
 	bl	proc_create
 
-	/* _printk("phys_reader_param: mapped ...") */
+	/* _printk — announce ready, no mapping yet */
 	adrp	x0, fmt_ok
 	add	x0, x0, :lo12:fmt_ok
-	movz	x1, #0x4000, lsl #16
-	movz	x2, #0x1000, lsl #16
+	mov	x1, #0
+	mov	x2, #0
 	bl	_printk
 
 	/* return 0 */
 	mov	w0, #0
-	b	.Linit_ret
-
-.Linit_fail:
-	/* _printk("phys_reader_param: memremap failed ...") */
-	adrp	x0, fmt_fail
-	add	x0, x0, :lo12:fmt_fail
-	movz	x1, #0x4000, lsl #16
-	movz	x2, #0x1000, lsl #16
-	bl	_printk
-	mov	w0, #-12			/* -ENOMEM */
-
-.Linit_ret:
-	ldr	x19, [sp, #16]
-	ldp	x29, x30, [sp], #32
+	ldp	x29, x30, [sp], #16
 	autiasp
 	ret
 .size init_module, .-init_module
